@@ -1,24 +1,69 @@
 """
 PETRAILS — Intelligent Pet Insurance Risk & Claims Intelligence Backend
 FastAPI REST API with Dual-Engine Actuarial Rules and Predictive Scoring
+Integrated with MongoDB Atlas via PyMongo Async (AsyncMongoClient)
 """
 
+import sys
 import time
+from pathlib import Path
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Depends, Header
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Depends, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Ensure backend directory is in sys.path
+backend_dir = Path(__file__).resolve().parent
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+from database import db_manager, mask_mongodb_uri
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Lifecycle startup: Connect and verify MongoDB Atlas with real ping
+    print("=" * 60)
+    print("Initializing PETRAILS Backend & MongoDB Atlas Connection...")
+    print("=" * 60)
+    status = await db_manager.connect_and_verify()
+    if status["connected"]:
+        print(f"MongoDB Atlas Verified: CONNECTED (Ping: {status['pingMs']}ms | DB: {status['database']})")
+        print(f"Verified Collections: {', '.join(status.get('verifiedCollections', []))}")
+    else:
+        print(f"MongoDB Atlas Status: {status['status'].upper()}")
+        if status.get("error"):
+            print(f"Notice: {status['error']}")
+    yield
+    # Lifecycle shutdown: Close MongoDB connection pool cleanly
+    if db_manager.client:
+        try:
+            await db_manager.client.close()
+            print("MongoDB Atlas connection closed gracefully.")
+        except Exception:
+            pass
+
+
 app = FastAPI(
     title="PETRAILS Actuarial Intelligence API",
-    description="Enterprise API for pet insurance underwriting risk evaluation and claims anomaly detection.",
-    version="2.4.0"
+    description="Enterprise API for pet insurance underwriting risk evaluation and claims anomaly detection with MongoDB Atlas persistence.",
+    version="2.4.0",
+    lifespan=lifespan
 )
 
 # Enable CORS for frontend development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:3000",
+        "*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,286 +103,175 @@ class ClaimDecisionPayload(BaseModel):
     approvedAmountInr: Optional[float] = None
     decidedBy: Optional[str] = "Sarah Jenkins"
 
-class NewPetPayload(BaseModel):
-    id: str
-    name: str
-    species: str
-    breed: str
-    age: int
-    sex: str
-    weightKg: float
-    location: str
-    ownerName: str
-    registeredVetClinic: str
-    policyId: str
-
-class NewAssessmentPayload(BaseModel):
-    id: str
-    petId: str
-    petName: str
-    breed: str
-    species: str
-    ageText: str
-    sex: str
-    policyId: str
-
 # ---------------------------------------------------------
-# In-Memory Datastore & Initial Synthetic State
-# ---------------------------------------------------------
-
-DEMO_USER = {
-    "id": "usr-1",
-    "fullName": "Sarah Jenkins",
-    "email": "sarah.jenkins@petrails.insure",
-    "role": "Senior Underwriting Officer",
-    "authorityLimitInr": 500000,
-    "organization": "Tata AIG General Insurance"
-}
-
-ASSESSMENTS_DB = [
-    {
-        "id": "asm-1",
-        "petId": "pet-1",
-        "petName": "Max",
-        "breed": "Golden Retriever",
-        "species": "Dog",
-        "ageText": "6 years",
-        "sex": "Male",
-        "policyId": "PT-10291",
-        "riskLevel": "MEDIUM",
-        "combinedScore": 64,
-        "ruleScore": 58,
-        "mlScore": 67,
-        "modelConfidence": 91,
-        "calibrationBand": "Calibrated ±3.2%",
-        "informationGapsCount": 2,
-        "informationGaps": [
-            {
-                "id": "gap-1",
-                "title": "Incomplete Orthopedic Diagnostic & Outcome Records",
-                "description": "An orthopedic treatment history was identified in the veterinary record, but the definitive radiologic diagnosis and long-term treatment outcome are incomplete.",
-                "questions": [
-                    "What was the definitive radiologic diagnosis of the right stifle joint?",
-                    "When was the latest physical examination performed for stifle joint stability?",
-                    "Was surgical intervention (e.g., TPLO / TTA) formally recommended or scheduled?"
-                ],
-                "status": "Requested",
-                "requestedAt": "2024-10-22T09:40:00Z",
-                "affectsCalibration": True
-            }
-        ],
-        "contributingFactors": [
-            {
-                "id": "f-1",
-                "name": "Previous orthopedic treatment",
-                "impact": 14,
-                "category": "Medical History",
-                "explanation": "History of stifle joint laxity and NSAID administration elevates joint underwriting hazard.",
-                "confidence": 94
-            },
-            {
-                "id": "f-2",
-                "name": "Age bracket (6 years)",
-                "impact": 10,
-                "category": "Age & Breed",
-                "explanation": "Canine senior transition window correlates with higher probability of chronic claims.",
-                "confidence": 92
-            },
-            {
-                "id": "f-3",
-                "name": "Breed profile (Golden Retriever)",
-                "impact": 8,
-                "category": "Age & Breed",
-                "explanation": "Breed actuarial baseline exhibits higher incidence of hip dysplasia.",
-                "confidence": 89
-            },
-            {
-                "id": "f-4",
-                "name": "Previous claims history",
-                "impact": 5,
-                "category": "Claims History",
-                "explanation": "Recent claim submission for surgical consultation during policy probation period.",
-                "confidence": 86
-            },
-            {
-                "id": "f-5",
-                "name": "Vaccination & preventive compliance",
-                "impact": -4,
-                "category": "Vaccination",
-                "explanation": "Consistent multi-year DHPPiL booster compliance reduces infectious risk.",
-                "confidence": 95
-            }
-        ],
-        "status": "Under Review",
-        "lastUpdated": "2 hours ago",
-        "decisionHistory": [
-            {
-                "id": "dh-1",
-                "action": "Request Information",
-                "user": "Sarah Jenkins",
-                "role": "Senior Underwriting Officer",
-                "timestamp": "2024-10-22 15:10 IST",
-                "notes": "Dispatched 3 clinical questions to Cessna Lifeline regarding stifle laxity prognosis.",
-                "ruleScoreAtTime": 58,
-                "mlScoreAtTime": 67
-            }
-        ],
-        "imageUrl": "https://images.unsplash.com/photo-1552053831-71594a27632d?auto=format&fit=crop&w=1200&q=80"
-    }
-]
-
-CLAIMS_DB = [
-    {
-        "id": "cl-20831",
-        "claimNumber": "CL-20831",
-        "petId": "pet-1",
-        "petName": "Max",
-        "breed": "Golden Retriever",
-        "species": "Dog",
-        "claimType": "Orthopedic Surgery & Diagnostics",
-        "treatment": "Orthopedic Surgery & Post-Op Arthroscopy",
-        "amountInr": 42000,
-        "date": "2024-10-18",
-        "status": "Under Review",
-        "anomalyScore": 31,
-        "anomalyLevel": "LOW CONCERN",
-        "indicators": [
-            {
-                "name": "Treatment frequency",
-                "status": "Moderate",
-                "detail": "First orthopedic procedure billed in 14 months."
-            },
-            {
-                "name": "Invoice deviation",
-                "status": "Low",
-                "detail": "Billed amount (₹42,000) is within standard Bangalore veterinary surgery benchmark (₹38,000 – ₹46,000)."
-            },
-            {
-                "name": "Previous claim pattern",
-                "status": "Elevated",
-                "detail": "Claim initiated 47 days after policy modification endorsement."
-            },
-            {
-                "name": "Medical consistency",
-                "status": "Normal",
-                "detail": "Carprofen prescription matches arthroscopy clinical discharge protocols."
-            }
-        ],
-        "invoiceDetails": {
-            "invoiceNumber": "INV-CESSNA-2024-8841",
-            "clinicGstNumber": "29AAACC1234F1Z8",
-            "clinicName": "Cessna Lifeline Veterinary Hospital, Indiranagar",
-            "procedureCodes": ["VET-SURG-ORTHO-04", "VET-ANES-GEN-02"],
-            "medicationBilled": 6400,
-            "surgicalBilled": 24500,
-            "diagnosticBilled": 7100,
-            "roomCharges": 4000,
-            "totalBilledInr": 42000,
-            "standardMarketRangeInr": [38000, 46000]
-        },
-        "medicalEvidence": [
-            {
-                "id": "ev-1",
-                "title": "Surgical Discharge Summary & Operative Note",
-                "type": "Surgical Discharge Summary",
-                "date": "2024-10-18",
-                "source": "Cessna Lifeline Specialty Surgery Unit",
-                "verified": True,
-                "notes": "Exploratory arthroscopy of right stifle joint confirming minor meniscal debridement.",
-                "fileSize": "2.4 MB PDF"
-            }
-        ],
-        "imageUrl": "https://images.unsplash.com/photo-1552053831-71594a27632d?auto=format&fit=crop&w=1200&q=80"
-    }
-]
-
-# ---------------------------------------------------------
-# Health & Status Route
+# Health & Database Status Routes
 # ---------------------------------------------------------
 
 @app.get("/api/health")
-def health_check():
+async def health_check():
+    db_status = db_manager.get_status()
     return {
         "status": "healthy",
         "service": "PETRAILS Actuarial Intelligence API",
         "version": "2.4.0",
-        "port": 8000
+        "port": 8000,
+        "database": {
+            "connected": db_status["connected"],
+            "status": db_status["status"],
+            "database": db_status["database"],
+            "pingMs": db_status["pingMs"],
+            "maskedUri": db_status["maskedUri"],
+            "configured": db_status["configured"],
+            "verifiedCollections": db_status.get("verifiedCollections", [])
+        }
     }
+
+@app.get("/api/database/status")
+async def get_database_status():
+    """Returns detailed, credential-safe MongoDB Atlas status and diagnostics."""
+    return db_manager.get_status()
+
+@app.post("/api/database/reconnect")
+async def reconnect_database():
+    """Re-reads backend/.env and re-verifies MongoDB Atlas connection live with a real ping."""
+    return await db_manager.connect_and_verify()
 
 # ---------------------------------------------------------
 # Authentication Routes
 # ---------------------------------------------------------
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest):
+async def login(payload: LoginRequest):
+    user = await db_manager.get_user_by_email(payload.email)
+    if not user:
+        user = {
+            "id": "usr-1",
+            "fullName": "Sarah Jenkins",
+            "email": payload.email,
+            "role": "Senior Underwriting Officer",
+            "authorityLimitInr": 500000,
+            "organization": "Tata AIG General Insurance"
+        }
     return {
         "token": "petrails-jwt-authenticated-token",
-        "user": DEMO_USER
+        "user": user
     }
 
 @app.post("/api/auth/register")
-def register(payload: RegisterRequest):
+async def register(payload: RegisterRequest):
+    new_user = {
+        "id": f"usr-{int(time.time() * 1000)}",
+        "organization": payload.organization,
+        "fullName": payload.fullName,
+        "email": payload.workEmail,
+        "role": payload.role,
+        "authorityLimitInr": 500000,
+        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+    persisted_user = await db_manager.create_user(new_user)
     return {
         "token": "petrails-jwt-registered-token",
-        "user": {
-            **DEMO_USER,
-            "organization": payload.organization,
-            "fullName": payload.fullName,
-            "email": payload.workEmail,
-            "role": payload.role
-        }
+        "user": persisted_user
     }
 
 @app.get("/api/auth/me")
-def get_me():
-    return DEMO_USER
+async def get_me():
+    user = await db_manager.get_user_by_email("sarah.jenkins@petrails.insure")
+    return user or {
+        "id": "usr-1",
+        "fullName": "Sarah Jenkins",
+        "email": "sarah.jenkins@petrails.insure",
+        "role": "Senior Underwriting Officer",
+        "authorityLimitInr": 500000,
+        "organization": "Tata AIG General Insurance"
+    }
 
 # ---------------------------------------------------------
 # Assessment Endpoints & Dual-Engine Scoring
 # ---------------------------------------------------------
 
 @app.get("/api/assessments")
-def get_assessments():
-    return ASSESSMENTS_DB
+async def get_assessments():
+    return await db_manager.get_assessments()
 
 @app.get("/api/assessments/{assessment_id}")
-def get_assessment(assessment_id: str):
-    for asm in ASSESSMENTS_DB:
-        if asm["id"] == assessment_id:
-            return asm
+async def get_assessment(assessment_id: str):
+    asm = await db_manager.get_assessment(assessment_id)
+    if asm:
+        return asm
     raise HTTPException(status_code=404, detail="Assessment not found")
+
+@app.post("/api/assessments")
+async def create_assessment(payload: Dict[str, Any] = Body(...)):
+    """Persists a new underwriting risk assessment into MongoDB Atlas."""
+    if not payload.get("id"):
+        payload["id"] = f"asm-{int(time.time() * 1000)}"
+    if not payload.get("lastUpdated"):
+        payload["lastUpdated"] = "Just now"
+    return await db_manager.create_assessment(payload)
 
 @app.post("/api/assessments/{assessment_id}/decision")
-def record_decision(assessment_id: str, payload: UnderwriterDecisionPayload):
-    for asm in ASSESSMENTS_DB:
-        if asm["id"] == assessment_id:
-            new_history_entry = {
-                "id": f"dh-{int(time.time()*1000)}",
-                "action": payload.decision,
-                "user": payload.user or "Sarah Jenkins",
-                "role": "Senior Underwriting Officer",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M IST"),
-                "notes": payload.notes,
-                "ruleScoreAtTime": asm.get("ruleScore", 58),
-                "mlScoreAtTime": asm.get("mlScore", 67)
-            }
-            if "decisionHistory" not in asm or asm["decisionHistory"] is None:
-                asm["decisionHistory"] = []
-            asm["decisionHistory"].insert(0, new_history_entry)
-            asm["status"] = (
-                "Approved" if payload.decision == "Approve"
-                else "Information Requested" if payload.decision == "Request Information"
-                else "Referred"
-            )
-            return {"success": True, "decision": new_history_entry}
-    raise HTTPException(status_code=404, detail="Assessment not found")
+async def record_decision(assessment_id: str, payload: UnderwriterDecisionPayload):
+    asm = await db_manager.get_assessment(assessment_id)
+    if not asm:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    new_history_entry = {
+        "id": f"dh-{int(time.time() * 1000)}",
+        "action": payload.decision,
+        "user": payload.user or "Sarah Jenkins",
+        "role": "Senior Underwriting Officer",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M IST"),
+        "notes": payload.notes,
+        "ruleScoreAtTime": asm.get("ruleScore", 58),
+        "mlScoreAtTime": asm.get("mlScore", 67)
+    }
+    new_status = (
+        "Approved" if payload.decision == "Approve"
+        else "Information Requested" if payload.decision == "Request Information"
+        else "Referred"
+    )
+    result = await db_manager.record_assessment_decision(assessment_id, new_history_entry, new_status)
+    return {"success": True, "decision": result or new_history_entry}
 
 @app.post("/api/assessments/{assessment_id}/information-request")
-def request_information(assessment_id: str, payload: InfoRequestPayload):
+async def request_information(assessment_id: str, payload: InfoRequestPayload):
+    asm = await db_manager.get_assessment(assessment_id)
+    if not asm:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    gap_entry = {
+        "id": f"gap-{int(time.time() * 1000)}",
+        "title": payload.gapTitle or f"Clinical Questionnaire for {payload.recipient}",
+        "description": f"Dispatched questionnaire with {len(payload.questions)} inquiries ({payload.urgency}).",
+        "questions": payload.questions,
+        "status": "Requested",
+        "requestedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "affectsCalibration": True
+    }
+    history_entry = {
+        "id": f"dh-{int(time.time() * 1000)}",
+        "action": "Request Information",
+        "user": "Sarah Jenkins",
+        "role": "Senior Underwriting Officer",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M IST"),
+        "notes": f"Dispatched {len(payload.questions)} questions to {payload.recipient}.",
+        "ruleScoreAtTime": asm.get("ruleScore", 58),
+        "mlScoreAtTime": asm.get("mlScore", 67)
+    }
+    await db_manager.record_assessment_decision(assessment_id, history_entry, "Information Requested")
+    await db_manager.record_information_request(assessment_id, {
+        "recipient": payload.recipient,
+        "urgency": payload.urgency,
+        "questions": payload.questions,
+        "gapTitle": payload.gapTitle
+    })
+
     return {
         "success": True,
         "message": f"Questionnaire dispatched to {payload.recipient}",
-        "dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S UTC")
+        "dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "gap": gap_entry
     }
 
 # ---------------------------------------------------------
@@ -345,54 +279,82 @@ def request_information(assessment_id: str, payload: InfoRequestPayload):
 # ---------------------------------------------------------
 
 @app.get("/api/claims")
-def get_claims():
-    return CLAIMS_DB
+async def get_claims():
+    return await db_manager.get_claims()
 
 @app.get("/api/claims/{claim_id}")
-def get_claim(claim_id: str):
-    for claim in CLAIMS_DB:
-        if claim["id"] == claim_id:
-            return claim
+async def get_claim(claim_id: str):
+    claim = await db_manager.get_claim(claim_id)
+    if claim:
+        return claim
     raise HTTPException(status_code=404, detail="Claim not found")
 
 @app.post("/api/claims/{claim_id}/decision")
-def record_claim_decision(claim_id: str, payload: ClaimDecisionPayload):
-    for claim in CLAIMS_DB:
-        if claim["id"] == claim_id:
-            claim["status"] = "Approved" if "Approve" in payload.status else "Under Review"
-            decision_entry = {
-                "status": payload.status,
-                "approvedAmountInr": payload.approvedAmountInr or (claim["amountInr"] * 0.9),
-                "notes": payload.notes,
-                "decidedBy": payload.decidedBy or "Sarah Jenkins",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M IST")
-            }
-            claim["adjusterDecision"] = decision_entry
-            return {"success": True, "decision": decision_entry}
-    raise HTTPException(status_code=404, detail="Claim not found")
+async def record_claim_decision(claim_id: str, payload: ClaimDecisionPayload):
+    claim = await db_manager.get_claim(claim_id)
+    if not claim:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    new_status = "Approved" if "Approve" in payload.status else "Under Review"
+    decision_entry = {
+        "status": payload.status,
+        "approvedAmountInr": payload.approvedAmountInr or (claim.get("amountInr", 40000) * 0.9),
+        "notes": payload.notes,
+        "decidedBy": payload.decidedBy or "Sarah Jenkins",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M IST")
+    }
+    result = await db_manager.record_claim_decision(claim_id, decision_entry, new_status)
+    return {"success": True, "decision": result or decision_entry}
+
+# ---------------------------------------------------------
+# Pets Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/pets")
+async def get_pets():
+    return await db_manager.get_pets()
+
+@app.get("/api/pets/{pet_id}")
+async def get_pet(pet_id: str):
+    pet = await db_manager.get_pet(pet_id)
+    if pet:
+        return pet
+    raise HTTPException(status_code=404, detail="Pet not found")
+
+@app.post("/api/pets")
+async def create_pet(payload: Dict[str, Any] = Body(...)):
+    """Persists a new pet record into MongoDB Atlas."""
+    if not payload.get("id"):
+        payload["id"] = f"pet-{int(time.time() * 1000)}"
+    return await db_manager.create_pet(payload)
+
+# ---------------------------------------------------------
+# Information Requests & Audit Logs Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/information-requests")
+async def get_information_requests():
+    if db_manager.is_connected and db_manager.db is not None:
+        cursor = db_manager.db["information_requests"].find({}, {"_id": 0})
+        return await cursor.to_list(length=100)
+    return []
+
+@app.get("/api/audit-logs")
+async def get_audit_logs():
+    if db_manager.is_connected and db_manager.db is not None:
+        cursor = db_manager.db["audit_logs"].find({}, {"_id": 0}).sort("timestamp", -1)
+        return await cursor.to_list(length=100)
+    return []
 
 # ---------------------------------------------------------
 # Analytics & Metrics Endpoints
 # ---------------------------------------------------------
 
 @app.get("/api/analytics/portfolio")
-def get_portfolio_metrics():
-    return {
-        "totalApplications": len(ASSESSMENTS_DB) + 23,
-        "requireAttention": 7,
-        "claimsUnderReview": len(CLAIMS_DB) + 17,
-        "informationGaps": 13,
-        "riskDistribution": {"low": 48, "medium": 38, "high": 14},
-        "claimsActivity": [
-            {"month": "May", "submitted": 42, "approved": 38, "flagged": 4, "averagePayoutInr": 28400},
-            {"month": "Jun", "submitted": 56, "approved": 51, "flagged": 5, "averagePayoutInr": 31200},
-            {"month": "Jul", "submitted": 68, "approved": 62, "flagged": 6, "averagePayoutInr": 29800},
-            {"month": "Aug", "submitted": 74, "approved": 65, "flagged": 9, "averagePayoutInr": 34500},
-            {"month": "Sep", "submitted": 89, "approved": 80, "flagged": 9, "averagePayoutInr": 33900},
-            {"month": "Oct", "submitted": 64, "approved": 52, "flagged": 7, "averagePayoutInr": 36200}
-        ]
-    }
+async def get_portfolio_metrics():
+    return await db_manager.get_portfolio_metrics()
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
